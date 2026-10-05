@@ -104,9 +104,23 @@ def get_text_engine(sd_model):
     return None
 
 def tokenize_wrapper(engine):
-    """``tokenize_line`` returns ``(chunks, token_count)`` on CLIP based engines but
-    only ``chunks`` on every LLM based engine of Forge Neo. Normalise both."""
-    tokenize_line = engine.tokenize_line
+    """Return ``tokenize(line) -> (tokens, token_count)`` for any text processing engine.
+
+    ``tokenize_line`` returns ``(chunks, token_count)`` on CLIP based engines but only
+    ``chunks`` on the LLM based engines of older Forge Neo builds. Recent builds (the
+    TextProcessingEngine rewrite) have no ``tokenize_line`` on the LLM engines at all,
+    only ``tokenize``, which returns the token ids. Normalise the three of them."""
+    tokenize_line = getattr(engine, "tokenize_line", None)
+
+    if tokenize_line is None:
+        def tokenize(line):
+            tokens = engine.tokenize(line)
+            # Anima returns a pair, (Qwen ids, T5 ids). The Qwen ids are the ones counted
+            if isinstance(tokens, tuple):
+                tokens = tokens[0]
+            return tokens, len(tokens)
+
+        return tokenize
 
     def tokenize(line):
         result = tokenize_line(line)
@@ -226,9 +240,13 @@ class Script(modules.scripts.Script):
             modelclass = type(p.sd_model).__name__
             if modelclass in MODELTYPE_FROM_CLASS:
                 self.modeltype = modeltype = MODELTYPE_FROM_CLASS[modelclass]
-                # warm up / make sure the text encoder is resident before tokenizing
-                input = SdConditioning([""], width=p.width, height=p.height)
-                engine(input)
+                # warm up / make sure the text encoder is resident before tokenizing.
+                # The engines without tokenize_line (recent Forge Neo) tokenize on their
+                # own, and calling one here would run its text encoder before Forge
+                # has loaded it
+                if hasattr(engine, "tokenize_line"):
+                    input = SdConditioning([""], width=p.width, height=p.height)
+                    engine(input)
             tokenizer = tokenize_wrapper(engine)
             if "flux" in str(type(p.sd_model.forge_objects.unet.model.diffusion_model)):
                 self.modeltype = modeltype = "flux"
@@ -307,10 +325,14 @@ class Script(modules.scripts.Script):
                 self.strength = strength
                 return conds, conds.shape[1]
                
+            # The LLM engines get the bare text. Recent Forge Neo never parses the attention
+            # syntax on Z-Image and Krea2, and on Anima only while Emphasis is not "None",
+            # so a "(text:1.0)" wrapper would reach the text encoder as literal "(text",
+            # ":", "1", ".", "0" and ")" tokens, and those would be negated as well
             if modeltype == "ZImage":
                 strength = []
                 for target in targets:
-                    input = SdConditioning([f"({target[0]}:1.0)"], width=p.width, height=p.height)
+                    input = SdConditioning([target[0]], width=p.width, height=p.height)
                     with devices.autocast():
                         cond = prompt_parser.get_learned_conditioning(shared.sd_model,input,p.steps)
                     cond_data = cond[0][0].cond
@@ -324,7 +346,7 @@ class Script(modules.scripts.Script):
             if modeltype in ("Anima", "Krea"):
                 strength = []
                 for target in targets:
-                    input = SdConditioning([f"({target[0]}:1.0)"], width=p.width, height=p.height)
+                    input = SdConditioning([target[0]], width=p.width, height=p.height)
                     with devices.autocast():
                         cond = prompt_parser.get_learned_conditioning(shared.sd_model,input,p.steps)
                     cond_data = cond[0][0].cond
@@ -458,6 +480,11 @@ class Script(modules.scripts.Script):
                         break
                 self.conds = condslist
                 self.contokens = tokenslist
+                # The DiT branches below only use the first entry, the positive prompt, which
+                # is None while it has no negative weight (a weight in the negative prompt
+                # only, or a prompt schedule that adds it later). There is nothing to append then
+                if self.modeltype != "SD" and condslist and condslist[0] is None:
+                    self.conds, self.contokens = [], []
 
             uncondslist = []
             untokenslist = []
